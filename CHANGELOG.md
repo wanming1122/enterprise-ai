@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [检索评测基建] - 2026-09-13
+
+### Added
+
+- `backend/evals/`：RAG 检索评测离线包——语料快照导出、55 题金标集（事实 / 多切片 / 跨文件 / 同义改写 + 语料外负例）、五项 IR 指标（Recall / Precision / HitRate / MRR / NDCG，纯 stdlib 实现）、B0~B4 消融跑批 CLI（逐题明细 + Markdown 报告）、LLM 起草候选问题、模型配置初始化脚本（智谱 rerank / DeepSeek 连通探针与 Fernet 加密入库）
+- `backend/tests/test_crag_merge.py` / `test_embedding_grouping.py`：CRAG 轮次合并与查询向量分组的纯函数单测（8 用例）
+
+### Changed
+
+- `kb_rag_service`：新增 `retrieve_with_stages` 阶段化检索（返回向量 / BM25 / 融合 / 重排各阶段完整候选，生产 `retrieve` 委托之）；查询向量按（embedding 模型, 维度）分组嵌入，多库检索调用次数 10 → 分组数（检索 p50 5.6s → 1.1s）；CRAG 改写重检由「整体替换」改为「原查询加权并集」（`merge_round_results`），修复改写漂移挤占已命中切片的问题
+- 模型配置：新增智谱 rerank（实测净负增益，默认关闭）与 DeepSeek 备用生成模型（探针通过入库，不设默认）
+
+### Validated
+
+- 金标集实测（全库联合检索、10 库 103 切片）：Recall@6 0.98 / NDCG@6 0.90 / MRR@6 0.90；四份评测报告与逐题明细见 `backend/evals/reports/`
+- 测试 144 → 152 用例，全部通过
+
 ## [Agent P0 加固] - 2026-09-13
 
 ### Fixed
