@@ -283,9 +283,11 @@ async def _tools_node(state: AgentState) -> dict:
                         _tool_retrieve, db, query, state.get("kb_ids")
                     )
                 except HTTPException as exc:
+                    logger.warning("retrieve 工具失败（业务拒绝）query=%r: %s", query, exc.detail)
                     content = f"知识库检索暂不可用：{exc.detail}。请基于已有知识回答，并如实告知用户检索服务暂时不可用。"
                     chunks = []
                 except Exception as exc:  # noqa: BLE001
+                    logger.exception("retrieve 工具执行异常 query=%r", query)
                     content = f"知识库检索执行异常：{exc}。请基于已有知识回答，并如实告知用户检索服务暂时不可用。"
                     chunks = []
                 if chunks:
@@ -312,11 +314,14 @@ async def _tools_node(state: AgentState) -> dict:
                 try:
                     content = await asyncio.to_thread(_tool_nl2sql, db, state, question)
                 except HTTPException as exc:
+                    logger.warning("nl2sql 工具失败（业务拒绝）question=%r: %s", question, exc.detail)
                     content = f"数据查询暂不可用：{exc.detail}。请如实告知用户当前无法查询产品数据。"
                 except Exception as exc:  # noqa: BLE001
+                    logger.exception("nl2sql 工具执行异常 question=%r", question)
                     content = f"数据查询执行异常：{exc}。请如实告知用户当前无法查询产品数据。"
                 result = {}
             else:
+                logger.warning("模型调用了未注册工具 %r，已拒绝", name)
                 content = f"未知工具：{name}"
                 result = {}
             tool_msgs.append({"role": "tool", "tool_call_id": tc.get("id"), "name": name, "content": content})
@@ -401,6 +406,9 @@ async def _generate_node(state: AgentState) -> dict:
     answer: list[str] = []
     reasoning: list[str] = []
     usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "has_real": False}
+    # 是否已向客户端下发过任何增量（正文或思考）：为真后禁止静默重试，
+    # 否则重发的完整内容会与已下发的前半段在用户界面上重复
+    emitted = {"any": False}
 
     async def _consume_stream(stream) -> None:
         """消费流式输出：正文/思考增量下发，usage 累计（上游支持时为真实值）。
@@ -417,9 +425,11 @@ async def _generate_node(state: AgentState) -> dict:
                 usage_acc["has_real"] = True
             elif kind == "reasoning":
                 if deep:
+                    emitted["any"] = True
                     reasoning.append(delta)
                     writer({"kind": "reasoning", "delta": delta})
             else:
+                emitted["any"] = True
                 answer.append(delta)
                 writer({"kind": "message", "delta": delta})
 
@@ -441,11 +451,14 @@ async def _generate_node(state: AgentState) -> dict:
     safe_tokens = 3072
 
     async def _generate_once(stream_msgs: list[dict], budget: int) -> None:
-        """按 budget 生成；上游因超出输出上限拒绝时降级到保守预算再试一次。"""
+        """按 budget 生成；仅当尚未下发任何增量且上游因超出输出上限拒绝时，
+        降级到保守预算再试一次（该拒绝发生在请求期、无字节产出，重试不会重复）。
+        已下发增量（emitted）后一律不重试：流中途失败重发会使用户看到重复内容。
+        """
         try:
             await _consume_once(stream_msgs, budget)
         except HTTPException:
-            if budget <= safe_tokens:
+            if budget <= safe_tokens or emitted["any"]:
                 raise
             await _consume_once(stream_msgs, safe_tokens)
 
@@ -454,7 +467,7 @@ async def _generate_node(state: AgentState) -> dict:
         try:
             await _generate_once(msgs, first_tokens)
         except HTTPException:
-            if not state.get("images"):
+            if not state.get("images") or emitted["any"]:
                 raise
             # 带图提问且模型不支持视觉输入（请求即被拒，尚未产出增量）时，退化纯文本重试
             effective_msgs = _strip_images(msgs)
@@ -463,9 +476,10 @@ async def _generate_node(state: AgentState) -> dict:
         writer({"kind": "error", "message": str(exc.detail)})
         return {"answer": "", "reasoning": "", "citations": [], "error": str(exc.detail)}
 
-    if not "".join(answer).strip():
+    if not "".join(answer).strip() and not emitted["any"]:
         # 空回答兜底：推理型模型在长上下文（含工具结果）下可能只输出思考不输出正文，
-        # 加大配额重试一次；上游拒绝更大预算时忽略，走下方空回答提示而非整轮失败
+        # 加大配额重试一次；上游拒绝更大预算时忽略，走下方空回答提示而非整轮失败。
+        # 若思考增量已下发（emitted），重试会让思考面板重复，直接走空回答提示
         try:
             await _generate_once(effective_msgs, retry_tokens)
         except HTTPException:
@@ -601,11 +615,14 @@ async def chat_sse(
     result_holder 由路由层传入并转交 BackgroundTask：流结束后回填 ok/conversation_id，
     供异步记忆提取使用（客户端在 done 后断开也不影响后台提取）。
     request 用于断连检测：客户端中断后尽快取消 LLM 调用，避免 token 白白消耗。
+    库会话分段持有：仅「会话准备」与「结果持久化」两个短事务占用连接，图执行与
+    LLM 流式期间不占连接池——一条流式问答可持续数分钟，全程持有会耗尽连接池，
+    拖垮登录、CRUD 等无关接口。
     """
-    db = SessionLocal()
     started = time.perf_counter()
     try:
-        # 当前生效的生成模型配置：取真实上下文窗口与模型名（未配置窗口则回退全局常量）
+        # 当前生效的生成模型配置：取真实上下文窗口与模型名（未配置窗口则回退全局常量；
+        # resolve_llm_config 自带短会话，不占用本请求连接）
         try:
             llm_cfg = ai_model_service.resolve_llm_config(model_id)
             context_window = int(llm_cfg.get("context_window") or 0) or settings.CONTEXT_WINDOW_TOKENS
@@ -613,46 +630,52 @@ async def chat_sse(
         except HTTPException:
             context_window = settings.CONTEXT_WINDOW_TOKENS
             model_name = ""
-        if conversation_id:
-            conv = db.get(AIConversation, conversation_id)
-            if conv is None or conv.status == 2 or conv.user_id != user_id:
-                raise HTTPException(status_code=404, detail="会话不存在")
-        else:
-            conv = AIConversation(user_id=user_id, title=question[:32] or "新会话", status=1, source=source)
-            db.add(conv)
+
+        # ---------- 短事务 1：会话准备（建/续会话 → 历史 → 记忆召回 → 落用户消息） ----------
+        with SessionLocal() as db:
+            if conversation_id:
+                conv = db.get(AIConversation, conversation_id)
+                if conv is None or conv.status == 2 or conv.user_id != user_id:
+                    raise HTTPException(status_code=404, detail="会话不存在")
+                conv_id = conv.id
+            else:
+                conv = AIConversation(user_id=user_id, title=question[:32] or "新会话", status=1, source=source)
+                db.add(conv)
+                db.commit()
+                conv_id = conv.id
+            yield _sse("meta", {"conversation_id": conv_id})
+            if request is not None and await request.is_disconnected():
+                return
+
+            history = _build_history(db, conv_id)
+
+            # 长期记忆召回：按当前问题检索本人记忆注入 system prompt（失败静默降级；
+            # embedding 为网络调用，放入线程池避免阻塞事件循环）
+            system_prompt = AGENT_SYSTEM_PROMPT
+            memories: list[dict] = []
+            if ai_memory_service.memory_enabled(db, user_id):
+                try:
+                    memories = await asyncio.to_thread(ai_memory_service.recall, db, user_id, question)
+                except Exception:
+                    memories = []
+                injection = ai_memory_service.format_injection(memories)
+                if injection:
+                    system_prompt += injection
+            if memories:
+                yield _sse("memory", {
+                    "count": len(memories),
+                    "items": [{"id": m["id"], "type": m["memory_type"], "content": m["content"][:60]} for m in memories],
+                })
+            if request is not None and await request.is_disconnected():
+                return
+
+            imgs = validate_images(images or [])
+            db.add(AIMessage(
+                conversation_id=conv_id, role="user", content=question,
+                attachments=[{"type": "image", "url": img} for img in imgs] or None,
+            ))
             db.commit()
-        yield _sse("meta", {"conversation_id": conv.id})
-        if request is not None and await request.is_disconnected():
-            return
-
-        history = _build_history(db, conv.id)
-
-        # 长期记忆召回：按当前问题检索本人记忆注入 system prompt（失败静默降级；
-        # embedding 为网络调用，放入线程池避免阻塞事件循环）
-        system_prompt = AGENT_SYSTEM_PROMPT
-        memories: list[dict] = []
-        if ai_memory_service.memory_enabled(db, user_id):
-            try:
-                memories = await asyncio.to_thread(ai_memory_service.recall, db, user_id, question)
-            except Exception:
-                memories = []
-            injection = ai_memory_service.format_injection(memories)
-            if injection:
-                system_prompt += injection
-        if memories:
-            yield _sse("memory", {
-                "count": len(memories),
-                "items": [{"id": m["id"], "type": m["memory_type"], "content": m["content"][:60]} for m in memories],
-            })
-        if request is not None and await request.is_disconnected():
-            return
-
-        imgs = validate_images(images or [])
-        db.add(AIMessage(
-            conversation_id=conv.id, role="user", content=question,
-            attachments=[{"type": "image", "url": img} for img in imgs] or None,
-        ))
-        db.commit()
+        # 会话已关闭：图执行与 LLM 流式期间不持有连接
 
         init_messages = [
             {"role": "system", "content": system_prompt},
@@ -698,7 +721,7 @@ async def chat_sse(
                     if kind == "reasoning":
                         yield _sse("reasoning", {"delta": payload["delta"]})
                     elif kind == "message":
-                        yield _sse("message", {"conversation_id": conv.id, "delta": payload["delta"]})
+                        yield _sse("message", {"conversation_id": conv_id, "delta": payload["delta"]})
                     elif kind == "tool":
                         yield _sse("tool", {k: v for k, v in payload.items() if k != "kind"})
                     elif kind == "citations":
@@ -739,24 +762,28 @@ async def chat_sse(
         }
         usage_stats["total_tokens"] = prompt_total + completion_total
 
+        # ---------- 短事务 2：结果持久化 ----------
         # 先落 tool 消息再落 assistant 终答，保证时间线为：工具调用 → 最终回答
-        for m in final_state.get("messages", []):
-            if m.get("role") == "tool":
-                db.add(AIMessage(
-                    conversation_id=conv.id, role="tool", tool_name=m.get("name"),
-                    content=(m.get("content") or "")[:TOOL_STORE_MAX_CHARS],
-                ))
-        assistant = AIMessage(
-            conversation_id=conv.id,
-            role="assistant",
-            content=final_state.get("answer", ""),
-            reasoning_content=(final_state.get("reasoning") or None) if deep_thinking else None,
-            citations=final_state.get("citations") or None,
-            usage=usage_stats,
-        )
-        db.add(assistant)
-        conv.updated_at = datetime.now()
-        db.commit()
+        with SessionLocal() as db:
+            for m in final_state.get("messages", []):
+                if m.get("role") == "tool":
+                    db.add(AIMessage(
+                        conversation_id=conv_id, role="tool", tool_name=m.get("name"),
+                        content=(m.get("content") or "")[:TOOL_STORE_MAX_CHARS],
+                    ))
+            assistant = AIMessage(
+                conversation_id=conv_id,
+                role="assistant",
+                content=final_state.get("answer", ""),
+                reasoning_content=(final_state.get("reasoning") or None) if deep_thinking else None,
+                citations=final_state.get("citations") or None,
+                usage=usage_stats,
+            )
+            db.add(assistant)
+            conv = db.get(AIConversation, conv_id)
+            conv.updated_at = datetime.now()
+            db.commit()
+            message_id = assistant.id
         # 工具结果容量（本轮 tool 消息），并入分类明细与总容量
         tool_results = [
             m for m in final_state.get("messages", []) if m.get("role") == "tool"
@@ -780,8 +807,8 @@ async def chat_sse(
             context_used = estimated_total
         duration_ms = int((time.perf_counter() - started) * 1000)
         done_payload = {
-            "conversation_id": conv.id,
-            "message_id": assistant.id,
+            "conversation_id": conv_id,
+            "message_id": message_id,
             "usage": usage_stats,
             "duration_ms": duration_ms,
             "context_tokens": context_used,
@@ -793,11 +820,9 @@ async def chat_sse(
             done_payload["cache_hit_rate"] = cache_hit_rate
         yield _sse("done", done_payload)
         if result_holder is not None:
-            result_holder.update(ok=True, conversation_id=conv.id)
+            result_holder.update(ok=True, conversation_id=conv_id)
     except HTTPException as exc:
         yield _sse("error", {"message": str(exc.detail)})
-    finally:
-        db.close()
 
 
 # ---------- 会话管理 ----------

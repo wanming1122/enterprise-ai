@@ -4,9 +4,13 @@
 消除两处重复的 chroma 初始化 / 批量 upsert / 查询样板。软删等业务过滤仍由调用方
 在 MySQL 侧二次执行（Chroma metadata 过滤不可靠的项目经验）。
 """
+import logging
+
 import chromadb
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 CLIENT = chromadb.PersistentClient(path=settings.CHROMA_DIR)
 
@@ -44,8 +48,8 @@ def upsert_points(
 def delete_ids(col, ids: list) -> None:
     try:
         col.delete(ids=ids)
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 删除失败不阻断业务（MySQL 软删兜底不可见），但必须留痕
+        logger.warning("Chroma 向量删除失败 ids=%s", ids, exc_info=True)
 
 
 def query(col, vector: list, n_results: int, where: dict | None = None):

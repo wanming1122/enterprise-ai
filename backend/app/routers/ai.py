@@ -13,6 +13,7 @@ from app.services import ai_chat_service, ai_memory_service, ai_model_service
 from app.services.menu_service import collect_permissions
 from app.utils.page import page_result
 from app.utils.response import ok
+from app.utils.sse import with_heartbeat
 
 router = APIRouter(prefix="/api/v1/ai", tags=["AI助手"])
 
@@ -32,12 +33,15 @@ async def chat(
     enable_server_admin = "ai:server_admin" in set(collect_permissions(db, operator.id))
     # 异步记忆提取：流结束后由 BackgroundTask 执行（客户端 done 后断开也不影响）
     holder: dict = {}
+    # with_heartbeat：工具执行/LLM 决策的长静默期插入注释行心跳，防反代空闲超时掐断
     return StreamingResponse(
-        ai_chat_service.chat_sse(
-            operator.id, operator.username, question=data.question.strip(),
-            conversation_id=data.conversation_id, deep_thinking=data.deep_thinking,
-            images=data.images, enable_server_admin=enable_server_admin, result_holder=holder,
-            model_id=data.model_id, kb_ids=data.kb_ids, source=data.source, request=request,
+        with_heartbeat(
+            ai_chat_service.chat_sse(
+                operator.id, operator.username, question=data.question.strip(),
+                conversation_id=data.conversation_id, deep_thinking=data.deep_thinking,
+                images=data.images, enable_server_admin=enable_server_admin, result_holder=holder,
+                model_id=data.model_id, kb_ids=data.kb_ids, source=data.source, request=request,
+            )
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

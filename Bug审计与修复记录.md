@@ -87,3 +87,24 @@
 ## 八、补充修复记录（2026-09-09 追加）
 
 - **P3-28 完整闭环**（原部分修复 → 已修复）：新增 `frontend/src/components/ForceChangePassword.tsx`；`MainLayout.tsx` 在 `need_reset_pwd===1` 时以改密页整体替换内容区（顶栏退出仍可用）；`types/index.ts` 的 `UserInfo` 补 `need_reset_pwd` 字段。端到端实测：管理员重置密码 → 临时密码登录被拦截（业务内容不可见）→ 提交改密后标记清零（API 确认）→ 新密码登录直达工作台不再拦截。测试账号已清理。
+
+---
+
+## 九、Agent 链路工程评估与 P0 加固（2026-09-13）
+
+> 审计日期：2026-09-13　|　方式：Agent 全链路人工代码审查（编排/LLM 客户端/三工具/记忆/检索/连接池/测试覆盖六维评估：架构、代码质量、性能、可维护性、错误处理、可扩展性）
+>
+> 结论：产出完整评估报告与分级改进计划（P0 稳定性 4 项 / P1 结构治理 7 项 / P2 长期演进 6 项）。本轮实施 P0 全部 4 项，回归 144/144 测试通过（原 140 + 新增心跳单测 4），前端零改动。
+
+| # | 优先级 | 问题 | 位置 | 影响 | 修复方案 |
+| --- | --- | --- | --- | --- | --- |
+| P0-1 | 🔴 | **chat_sse 全程持有 DB 会话**：一条流式问答（含多轮 LLM 调用，可达数分钟）独占一条连接，默认连接池仅 5+10，约 15 人并发提问即耗尽，拖垮登录/CRUD 等无关接口 | `ai_chat_service.py` `chat_sse`、`db/session.py` | 并发流式下全站接口被拖垮（容量风险） | 重构为两段短事务（会话准备 / 结果持久化），图执行与 LLM 流式期间不持有连接；`conv` 引用改为捕获的 `conv_id`/`message_id` 防分离实例访问；连接池显式 `pool_size=10, max_overflow=20` 并注释依据 |
+| P0-2 | 🔴 | **流式重试重复输出**：`_generate_once` 降级重试不检查"已产出增量"，流中途失败（`achat_stream` 在 produced=True 时抛 HTTPException）会重发全文，用户看到内容重复 | `ai_chat_service.py` `_generate_node` | 用户可见缺陷（低概率、直接影响） | 新增 `emitted` 标记：任何正文/思考增量下发后，预算降级重试、剥图重试、空回答重试三条路径一律改为走 error 事件；原有合法重试路径（请求期被拒、无字节产出）行为不变 |
+| P0-3 | 🟠 | **工具失败零日志**：`_tools_node` 捕获异常只拼降级文案不记日志；`server_admin` 异常静默；`vector_store.delete_ids` 吞掉一切异常 | `ai_chat_service.py` `_tools_node`、`server_admin_service.py`、`vector_store.py` | 生产工具静默失败无痕迹可查，排障靠猜 | 业务拒绝记 warning、未知异常记 `logger.exception`、未注册工具调用记 warning、沙箱路径越界拦截记 warning（安全审计留痕）、向量删除失败记 warning |
+| P0-4 | 🟠 | **SSE 无心跳**：工具执行/LLM 决策阶段可数十秒无字节下发，nginx 等反代默认 60s 空闲超时掐断连接（开发直连不暴露，上代理即炸） | 新增 `utils/sse.py`、`routers/ai.py` | 反向代理部署下长问答随机断流 | 新增 `with_heartbeat` 包裹器：`asyncio.wait` 事件与心跳竞争，静默超 15s 插入 `": ping"` 注释行（SSE 标准忽略行，前端 `parseSSEBlock` 对无 data 行的块返回 null，零协议改动）；收尾覆盖两种时机——等待期被取消时把取消传播进源生成器（LLM 真正中断），yield 边界关闭时显式 aclose 源生成器（确定性触发 with 块清理） |
+
+**修复涉及文件**：`app/services/ai_chat_service.py`（chat_sse 分段短事务 + emitted 守卫 + 工具日志）、`app/db/session.py`（连接池）、`app/services/server_admin_service.py` / `app/services/vector_store.py`（日志）、`app/utils/sse.py`（新增，心跳包裹器）、`app/routers/ai.py`（套用心跳）、`tests/test_sse_heartbeat.py`（新增，4 用例）
+
+**验证结果**：pytest 144/144 通过（test_sse_heartbeat 4 用例：事件透传、静默期心跳插入、等待期取消传播、yield 边界关闭清理）；`app.main` 导入冒烟通过（27 路由）；前端无需改动。
+
+**遗留（未在本轮范围）**：知识库问答端点（`routers/kb.py`）有相同反代超时暴露，但其 `chat_sse` 为同步生成器，套异步心跳需线程池桥接层，留待该服务异步化时一并覆盖；P1/P2 改进项（工具注册表化、llm_client 去重、用量配额、图片外置、BM25 性能等）见评估报告改进计划。

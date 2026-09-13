@@ -6,12 +6,15 @@
 - 读取仅限文本文件且单次 ≤100KB；
 - 仅持有 ai:server_admin 权限的账号，其 AI 助手会话才会注入该工具。
 """
+import logging
 import os
 import platform
 import shutil
 import string
 import subprocess
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]  # backend/app/services → 项目根
 MAX_READ_CHARS = 4000   # 单次读取返回给模型的字符上限
@@ -136,6 +139,9 @@ def run_action(action: str, params: dict | None = None) -> str:
 
         return f"不支持的操作 {action}"
     except ValueError as exc:
+        # 路径越界拒绝（沙箱拦截），可能来自模型被诱导构造的越权路径，留痕便于安全审计
+        logger.warning("server_admin 沙箱拦截 action=%s params=%s: %s", action, params, exc)
         return str(exc)
     except Exception as exc:  # noqa: BLE001 工具结果兜底，异常信息交给模型转述
+        logger.exception("server_admin 动作执行异常 action=%s params=%s", action, params)
         return f"执行失败：{exc}"

@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Agent P0 加固] - 2026-09-13
+
+### Fixed
+
+- **AI 问答连接池耗尽风险**：`chat_sse` 由全程持有 DB 会话重构为两段短事务，图执行与 LLM 流式期间不占连接；连接池显式 `pool_size=10, max_overflow=20`（此前默认 5+10，约 15 人并发流式问答即拖垮全站接口）
+- **流式重试重复输出**：`_generate_node` 新增 `emitted` 守卫，增量已下发后禁止静默重试（预算降级/剥图/空回答三条重试路径），防止流中途失败时用户看到重复内容
+- **SSE 反代空闲断流**：新增 `with_heartbeat` 心跳包裹器（静默超 15s 插入 `": ping"` 注释行），前端零改动兼容；断连取消行为与原直连一致
+- **工具失败静默**：retrieve/nl2sql/server_admin 失败路径与 Chroma 向量删除补齐 warning/exception 日志，生产排障可追溯
+
+### Added
+
+- `app/utils/sse.py`：SSE 心跳包裹器（事件与心跳竞争等待）
+- `tests/test_sse_heartbeat.py`：4 个心跳单测（透传 / 静默插入 / 等待期取消传播 / yield 边界关闭清理）
+
+### Changed
+
+- 测试 140 → 144 用例；详细评估与 P1/P2 改进计划见《Bug审计与修复记录.md》第九节
+
+---
+
 ## [M11] - 2026-09-09
 
 ### Added
