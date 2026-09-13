@@ -409,12 +409,17 @@ def _bm25_search(query_tokens: list[str], docs: list[dict], top_n: int) -> list[
 
 
 def _rrf_merge(vector_results: list[dict], bm25_results: list[dict], top_n: int) -> list[dict]:
-    """Reciprocal Rank Fusion：按 (kb_id, file_id, chunk_index) 归并双路排名。"""
+    """Reciprocal Rank Fusion：按 (kb_id, file_id, chunk_index) 归并双路排名。
+
+    向量路各库独立 collection，相似度跨库不可比，名次取库内名次（vec_rank）；
+    BM25 语料为多库合并的全量切片，名次即全局名次。
+    """
     def key(r: dict) -> tuple:
         return (r["kb_id"], r["file_id"], r["chunk_index"])
 
     fused: dict[tuple, dict] = {}
-    for rank, r in enumerate(vector_results, start=1):
+    for i, r in enumerate(vector_results, start=1):
+        rank = r.get("vec_rank") or i
         entry = fused.setdefault(key(r), {**r, "rrf": 0.0})
         entry["rrf"] += 1.0 / (RRF_K + rank)
     for rank, r in enumerate(bm25_results, start=1):
@@ -457,10 +462,34 @@ def _rerank(db: Session, query: str, candidates: list[dict]) -> list[dict] | Non
         return None
 
 
-def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> list[dict]:
-    """混合检索：向量 + BM25 双路粗排 → RRF 融合 → 重排精排（未配置重排模型时按融合序取）。
+def _query_vectors_for_collections(db: Session, query: str, members: list[tuple]) -> list[tuple]:
+    """按（embedding 模型, 维度）分组嵌入查询向量：同组各库复用一次 embedding 调用。
 
-    相似度字段语义：重排后为 rerank 相关性分；未重排时为向量余弦相似度，BM25 独有候选为 None。
+    入参 members 为 (知识库, Chroma collection) 列表；返回 (知识库, collection, 查询向量)。
+    全部知识库共用同一模型时，多库检索的查询嵌入从逐库一次收敛为整批一次。
+    """
+    groups: dict[tuple, list] = {}
+    for kb, collection in members:
+        groups.setdefault((kb.embedding_model, kb.embedding_dimension), []).append((kb, collection))
+    out: list[tuple] = []
+    for (model_name, dimension), items in groups.items():
+        qv = embed_texts([query], dimension, model_name=model_name, db=db)[0]
+        for kb, collection in items:
+            out.append((kb, collection, qv))
+    return out
+
+
+def retrieve_with_stages(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> dict:
+    """阶段化混合检索：向量/BM25 双路粗排 → RRF 融合 → 重排精排，返回各阶段完整候选。
+
+    供评测与检索调试观测各阶段表现；生产入口 retrieve() 委托本函数，保证单一实现。
+    返回字段：
+    - vector：软删过滤后、进入融合前的向量路候选（各库内 vec_rank 排列）
+    - bm25：BM25 粗排候选（bm25_score 降序）
+    - fused：RRF 融合候选（重排前的融合序）
+    - reranked：重排模型原始输出（未配置重排模型时为 None）
+    - final：软删兜底过滤并截断 top_k 后的最终结果
+    similarity 字段语义：重排后为 rerank 相关性分；未重排时向量路为余弦相似度，BM25 独有候选为 None。
     """
     kbs = db.scalars(
         select(KBKnowledgeBase).where(KBKnowledgeBase.id.in_(kb_ids), KBKnowledgeBase.status != 2)
@@ -468,19 +497,22 @@ def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> l
     if not kbs:
         raise HTTPException(status_code=422, detail="知识库不存在或已删除")
 
-    # 1) 向量粗排
-    vector_results: list[dict] = []
+    # 1) 向量粗排：按（embedding 模型, 维度）分组嵌入查询向量，组内各库复用
+    members: list[tuple] = []
     for kb in kbs:
         collection = _get_collection(kb, create=False)
-        if collection is None:
-            continue
-        qv = embed_texts([query], kb.embedding_dimension, model_name=kb.embedding_model, db=db)[0]
+        if collection is not None:
+            members.append((kb, collection))
+    vector_results: list[dict] = []
+    for kb, collection, qv in _query_vectors_for_collections(db, query, members):
         res = collection.query(
             query_embeddings=[qv], n_results=HYBRID_CANDIDATES,
             where={"status": "active"},
             include=["documents", "metadatas", "distances"],
         )
-        for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+        for vec_rank, (doc, meta, dist) in enumerate(
+            zip(res["documents"][0], res["metadatas"][0], res["distances"][0]), start=1
+        ):
             vector_results.append({
                 "kb_id": kb.id, "kb_name": kb.name,
                 "file_id": meta.get("file_id"), "chunk_index": meta.get("chunk_index"),
@@ -489,6 +521,7 @@ def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> l
                 "page": meta.get("page") or None,
                 "chunk_type": meta.get("chunk_type", "text"),
                 "similarity": round(max(0.0, 1.0 - dist), 4),  # cosine 距离转相似度
+                "vec_rank": vec_rank,  # 库内名次，供 RRF 使用（跨库相似度不可比）
             })
 
     # 2) MySQL 侧兜底过滤（文件软删即不可引用）+ BM25 粗排
@@ -500,8 +533,9 @@ def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> l
     bm25_results = _bm25_search(_tokenize(query), _bm25_corpus(db, kb_ids), HYBRID_CANDIDATES)
 
     # 3) RRF 融合 → 重排精排
-    candidates = _rrf_merge(vector_results, bm25_results, HYBRID_CANDIDATES)
-    ranked = _rerank(db, query, candidates)
+    fused = _rrf_merge(vector_results, bm25_results, HYBRID_CANDIDATES)
+    ranked = _rerank(db, query, fused)
+    candidates = fused
     if ranked is not None:
         candidates = [r for r in ranked if r["similarity"] >= RERANK_MIN_SCORE]
 
@@ -521,7 +555,22 @@ def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> l
         r["kb_name"] = kb_names.get(r["kb_id"], "")
         r["file_name"] = file_names.get(r["file_id"], "")
         results.append(r)
-    return results[:top_k]
+
+    return {
+        "vector": vector_results,
+        "bm25": bm25_results,
+        "fused": fused,
+        "reranked": ranked,
+        "final": results[:top_k],
+    }
+
+
+def retrieve(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6) -> list[dict]:
+    """混合检索（生产入口）：向量 + BM25 双路粗排 → RRF 融合 → 重排精排（未配置重排模型时按融合序取）。
+
+    委托 retrieve_with_stages，仅返回最终 top_k 结果。
+    """
+    return retrieve_with_stages(db, query=query, kb_ids=kb_ids, top_k=top_k)["final"]
 
 
 GRADE_PROMPT = (
@@ -563,11 +612,36 @@ def _rewrite_retrieval_query(query: str, results: list[dict]) -> str | None:
     return rewritten[:60] or None
 
 
+def merge_round_results(round_a: list[dict], round_b: list[dict], top_n: int,
+                        weight_a: float = 2.0, weight_b: float = 1.0) -> list[dict]:
+    """跨检索轮次的加权 RRF 并集合并（CRAG 改写轮防漂移）。
+
+    改写查询重检的结果若直接替换上一轮，会把已命中的相关切片挤出结果（评测 q017 案例）；
+    对称融合也不行——改写轮查询质量不可靠，其名次分会把原查询中排名靠后的 gold 挤出
+    top_k（v3 评测复现）。故原查询轮（round_a，代表用户真实意图）加权 weight_a，
+    改写轮（round_b）加权 weight_b：改写轮只在原查询头部之外补充填充，不会挤占既有命中。
+    按 (kb_id, file_id, chunk_index) 去重，weight/(RRF_K+名次) 累加排序再截断；
+    元数据保留首次出现的轮次。纯函数，便于测试。
+    """
+    def key(r: dict) -> tuple:
+        return (r["kb_id"], r["file_id"], r["chunk_index"])
+
+    fused: dict[tuple, dict] = {}
+    for results, weight in ((round_a, weight_a), (round_b, weight_b)):
+        for rank, r in enumerate(results, start=1):
+            entry = fused.setdefault(key(r), {**r, "round_rrf": 0.0})
+            entry["round_rrf"] += weight / (RRF_K + rank)
+    merged = sorted(fused.values(), key=lambda x: -x["round_rrf"])
+    return merged[:top_n]
+
+
 def retrieve_with_crag(db: Session, *, query: str, kb_ids: list[int], top_k: int = 6,
                        max_rounds: int = 2) -> tuple[list[dict], str]:
     """CRAG 简化版（RAG 三期）：检索 → LLM 分级 → 不足则改写查询重检，最多 max_rounds 轮。
 
-    返回 (最终结果, 实际使用的检索查询)；分级或重写失败时静默保留上一轮结果。
+    重检结果与上一轮加权融合取并集（原查询轮权重更高，而非替换），改写查询漂移时
+    已命中的相关切片不会被挤出，改写轮仅在余量内补充。返回 (最终结果, 实际使用的检索查询)；
+    分级或重写失败时静默保留上一轮结果。
     """
     used_query = query
     results = retrieve(db, query=used_query, kb_ids=kb_ids, top_k=top_k)
@@ -578,7 +652,8 @@ def retrieve_with_crag(db: Session, *, query: str, kb_ids: list[int], top_k: int
         if not rewritten or rewritten == used_query:
             break
         used_query = rewritten
-        results = retrieve(db, query=used_query, kb_ids=kb_ids, top_k=top_k)
+        new_results = retrieve(db, query=used_query, kb_ids=kb_ids, top_k=top_k)
+        results = merge_round_results(results, new_results, top_k)
     return results, used_query
 
 
